@@ -8,16 +8,21 @@ This avoids "train/serve skew" — a common bug where a model trained on one
 feature definition quietly behaves differently in production because live
 features are computed slightly differently.
 
-v2 update: added a longer rolling window (LONG_WINDOW) so drift — which
-unfolds over 3-10 hours — has a chance of being visible, since the original
-short window (WINDOW, ~30 min) could only see sudden changes. Also added a
-physics-informed rule for cross_sensor faults (see StationFeatureBuilder.
-check_cross_sensor_rule), since that fault type's signature — temperature
-rising while humidity is simultaneously pinned near saturation — is a known
-physical implausibility (violates the usual inverse temp/humidity
-correlation) that's more reliably caught by a direct domain rule than by
-diluting it among many ML features. This mirrors the PRD's own suggested
-hybrid ML + physics-rule approach (Section 4.4).
+v3 fix: the cross_sensor physics rule originally compared current temperature
+against the mean of its OWN short rolling window (WINDOW=6). That
+self-contaminates: the synthetic cross_sensor fault holds humidity near
+saturation for up to several hours, so within ~30 minutes the rolling window
+fills entirely with the fault's own elevated readings, and "deviation from
+recent mean" collapses toward zero right when the fault is still ongoing.
+Measured effect: this let only ~7% of true cross_sensor faults be caught by
+the rule (22/305 on a 10-day/5-station synthetic run), with the ML model
+catching the rest (or missing them too).
+
+Fix: maintain a SEPARATE temperature baseline that only accumulates readings
+taken while humidity looks normal (<= CROSS_SENSOR_HUMIDITY_THRESHOLD). Since
+the fault forces humidity high for its entire duration, none of the fault's
+own readings can ever pollute this baseline — it always reflects genuine
+pre-fault conditions, however long the fault lasts.
 """
 
 from collections import deque
@@ -44,6 +49,7 @@ STALE_EPSILON = 1e-6  # treat values closer than this as "unchanged" (float prec
 # 4-8C), kept a bit looser so it generalizes beyond the exact synthetic values.
 CROSS_SENSOR_HUMIDITY_THRESHOLD = 88.0
 CROSS_SENSOR_TEMP_DEVIATION_THRESHOLD = 1.0
+BASELINE_WINDOW = 30  # readings kept for the humidity-gated temperature baseline
 
 
 class StationFeatureBuilder:
@@ -68,6 +74,12 @@ class StationFeatureBuilder:
         }
         self._stale_streak: Dict[str, int] = {name: 0 for name in RAW_FEATURE_NAMES}
         self._last_value: Dict[str, float] = {name: None for name in RAW_FEATURE_NAMES}
+        # Temperature baseline gated on humidity looking normal — see the v3
+        # fix note at the top of this file. Only ever contains readings taken
+        # while humidity was <= CROSS_SENSOR_HUMIDITY_THRESHOLD, so a
+        # sustained high-humidity fault can never pull its own baseline up
+        # to match itself.
+        self._temp_baseline: deque = deque(maxlen=BASELINE_WINDOW)
 
     def update_and_build(self, temperature_c: float, pressure_hpa: float, humidity_pct: float) -> np.ndarray:
         """Feed in a new reading, update internal state, and return its feature vector."""
@@ -103,6 +115,13 @@ class StationFeatureBuilder:
 
             self._last_value[name] = val
 
+        # Only feed the humidity-gated temperature baseline while humidity
+        # looks normal — this must happen with THIS reading's own humidity,
+        # so a fault's elevated humidity readings are excluded from the
+        # moment the fault starts, not one step late.
+        if humidity_pct <= CROSS_SENSOR_HUMIDITY_THRESHOLD:
+            self._temp_baseline.append(temperature_c)
+
         max_stale_streak = float(max(self._stale_streak.values()))
 
         return np.array([
@@ -116,25 +135,35 @@ class StationFeatureBuilder:
     def check_cross_sensor_rule(self) -> bool:
         """
         Physics-informed check, evaluated AFTER update_and_build has been
-        called for the current reading (so self._history reflects it).
+        called for the current reading (so self._history and
+        self._temp_baseline reflect it).
 
         Temperature and humidity normally move inversely — humidity drops as
         temperature rises. If humidity is pinned near saturation WHILE
-        temperature is simultaneously above its own recent average, that
-        combination is physically implausible and is a strong, direct signal
-        of a cross-sensor fault — more reliable here than relying on the ML
-        model to rediscover this relationship among many other features.
+        temperature is simultaneously above its own PRE-FAULT baseline (not
+        its live, potentially fault-contaminated window), that combination is
+        physically implausible and is a strong, direct signal of a
+        cross-sensor fault — more reliable here than relying on the ML model
+        to rediscover this relationship among many other features.
+
+        Uses self._temp_baseline (humidity-gated) rather than the live
+        self._history window, since the live window fills with the fault's
+        own elevated readings within ~30 minutes on a sustained fault,
+        making a live-window comparison blind to the fault it's supposed to
+        catch for all but its first few readings.
         """
-        temp_hist = self._history["temperature_c"]
         humidity_hist = self._history["humidity_pct"]
-        if len(temp_hist) < 2:
+        if len(humidity_hist) == 0 or len(self._temp_baseline) < 3:
+            # Not enough pre-fault history yet to have a trustworthy baseline
+            # (e.g. right at startup, or humidity has been elevated since the
+            # very first reading for this station) — don't guess.
             return False
 
-        current_temp = temp_hist[-1]
+        current_temp = self._history["temperature_c"][-1]
         current_humidity = humidity_hist[-1]
-        temp_mean = float(np.mean(temp_hist))
+        baseline_temp_mean = float(np.mean(self._temp_baseline))
 
         return (
             current_humidity > CROSS_SENSOR_HUMIDITY_THRESHOLD
-            and current_temp > temp_mean + CROSS_SENSOR_TEMP_DEVIATION_THRESHOLD
+            and current_temp > baseline_temp_mean + CROSS_SENSOR_TEMP_DEVIATION_THRESHOLD
         )
